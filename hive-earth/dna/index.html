@@ -589,7 +589,7 @@ input[type=range]{accent-color:var(--accent);width:100%}
         </div>
         <div class="ctrl">
           <div class="lab"><span>☢️ Mutation rate</span><span id="mutVal"></span></div>
-          <input type="range" id="mutIn" min="1" max="40" value="6">
+          <input type="range" id="mutIn" min="1" max="40" value="3">
           <small id="mutHint"></small>
         </div>
         <div class="events">
@@ -818,6 +818,11 @@ G.COMP = { A: 'T', T: 'A', G: 'C', C: 'G' };
 G.revComp = s => { let o = ''; for (let i = s.length - 1; i >= 0; i--) o += G.COMP[s[i]] || 'N'; return o; };
 G.clean = s => String(s).toUpperCase().replace(/U/g, 'T').replace(/[^ACGT]/g, '');
 G.BASE_NAME = { A: 'adenine', T: 'thymine', G: 'guanine', C: 'cytosine' };
+/* Point mutations with a realistic bias: transitions (A↔G, C↔T) are twice as common as
+   transversions, giving Ti/Tv = 2.0, close to what is measured in human genomes. */
+G.TRANSITION = { A: 'G', G: 'A', C: 'T', T: 'C' };
+G.TRANSVERSIONS = { A: ['C', 'T'], G: ['C', 'T'], C: ['A', 'G'], T: ['A', 'G'] };
+G.pointMutation = b => Math.random() < 2 / 3 ? G.TRANSITION[b] : G.TRANSVERSIONS[b][(Math.random() * 2) | 0];
 
 /* NCBI translation tables, codons ordered T C A G for each position. */
 const NCBI_ORDER = { T: 0, C: 1, A: 2, G: 3 };
@@ -916,16 +921,29 @@ G.orfs = (seq, code = 'std', minCodons = 10) => {
   }
   return out.sort((a, b) => b.aa - a.aa);
 };
+/* Probability that one codon of random DNA (with this letter mix) is a STOP, and the chance
+   that a random ATG keeps reading for n codons. For equal letters p = 3/64, mean run ≈ 21 codons. */
+G.stopProb = (seq, code = 'std') => {
+  const f = { A: 0.25, C: 0.25, G: 0.25, T: 0.25 };
+  if (seq && seq.length >= 30) { for (const k in f) f[k] = 0; for (const c of seq) f[c] = (f[c] || 0) + 1; for (const k in f) f[k] /= seq.length; }
+  let p = 0; for (const a of 'TCAG') for (const b of 'TCAG') for (const c of 'TCAG') if (G.tr(a + b + c, code) === '*') p += f[a] * f[b] * f[c];
+  return p;
+};
+G.orfLuck = (aa, p) => Math.pow(1 - p, Math.max(0, aa - 1));
 G.stopsInFrame = (s, f, code) => { const out = []; for (let i = f; i + 3 <= s.length; i += 3) if (G.tr(s.substr(i, 3), code) === '*') out.push(i); return out; };
 
-G.PKA = { Nt: 8.6, Ct: 3.6, K: 10.8, R: 12.5, H: 6.5, D: 3.9, E: 4.1, C: 8.5, Y: 10.1 };
+/* pKa values of the Bjellqvist / ExPASy ProtParam method (also used by Biopython),
+   including residue-specific values for the N- and C-terminus. */
+G.PK_POS = { K: 10.0, R: 12.0, H: 5.98 }, G.PK_NEG = { D: 4.05, E: 4.45, C: 9.0, Y: 10.0 };
+G.PK_NT = { A: 7.59, M: 7.0, S: 6.93, P: 8.36, T: 6.82, V: 7.44, E: 7.7 }, G.PK_CT = { D: 4.55, E: 4.75 };
 G.charge = (p, pH) => {
-  const pos = pk => 1 / (1 + Math.pow(10, pH - pk));
-  const neg = pk => -1 / (1 + Math.pow(10, pk - pH));
-  let q = pos(G.PKA.Nt) + neg(G.PKA.Ct);
+  if (!p.length) return 0;
+  const pos = pk => 1 / (Math.pow(10, pH - pk) + 1);
+  const neg = pk => -1 / (Math.pow(10, pk - pH) + 1);
+  let q = pos(G.PK_NT[p[0]] ?? 7.5) + neg(G.PK_CT[p[p.length - 1]] ?? 3.55);
   for (const c of p) {
-    if (c === 'K' || c === 'R' || c === 'H') q += pos(G.PKA[c]);
-    else if (c === 'D' || c === 'E' || c === 'C' || c === 'Y') q += neg(G.PKA[c]);
+    if (G.PK_POS[c] !== undefined) q += pos(G.PK_POS[c]);
+    else if (G.PK_NEG[c] !== undefined) q += neg(G.PK_NEG[c]);
   }
   return q;
 };
@@ -938,11 +956,11 @@ G.tmSegments = (p, w = 19, thr = 1.6) => {
   for (let i = 0; i + w <= p.length; i++) {
     if (i > 0) s += kd(p[i + w - 1]) - kd(p[i - 1]);
     if (s / w > thr) {
-      if (cur && i <= cur.e) cur.e = i + w;
-      else { cur = { s: i, e: i + w }; segs.push(cur); }
+      if (cur && i <= cur.last + w) { cur.last = i; if (s > cur.best) { cur.best = s; cur.s = i; cur.e = i + w; } }
+      else { cur = { s: i, e: i + w, last: i, best: s }; segs.push(cur); }
     }
   }
-  return segs;
+  return segs.map(x => ({ s: x.s, e: x.e, score: x.best / w }));
 };
 G.stats = raw => {
   const p = raw.replace(/\*/g, '');
@@ -1243,10 +1261,13 @@ const PRESETS = [
     blurb: 'The hormone that tells cells to take in sugar. In 1978 it became the first human protein made by genetically engineered bacteria. ' + SPELLED },
   { id: 'gfp', group: 'Famous proteins', emoji: '💚', name: 'GFP: jellyfish glow protein', prot: PROT.GFP, uniprot: 'P42212', glow: true,
     blurb: 'From the jellyfish Aequorea victoria. Amino acids 65–67 (Ser-Tyr-Gly) fold into its light-making core. Try codon 66: TAC→CAC makes it glow blue! ' + SPELLED },
-  { id: 'humanin', group: 'Microproteins (dark proteome)', emoji: '🧠', name: 'Humanin (24 aa)', prot: PROT.HN, uniprot: 'Q8IVG9',
-    blurb: 'A brain-protecting microprotein discovered in 2001. Its gene hides inside the mitochondrial 16S rRNA gene: a gene inside a gene. ' + SPELLED },
-  { id: 'motsc', group: 'Microproteins (dark proteome)', emoji: '🏃', name: 'MOTS-c (16 aa)', prot: PROT.MOTSC, uniprot: 'A0A0C5B5G6',
-    blurb: 'A metabolism microprotein found in 2015 hiding in the mitochondrial 12S rRNA gene. In mice it helped prevent diet-induced obesity. ' + SPELLED },
+  { id: 'humanin', group: 'Microproteins (dark proteome)', emoji: '🧠', name: 'Humanin (24 aa)', uniprot: 'Q8IVG9',
+    seq: () => 'ATGGCTCCACGAGGGTTCAGCTGTCTCTTACTTTTAACCAGTGAAATTGACCTGCCCGTGAAGAGGCGGGCATAA',
+    blurb: 'The real 75-letter ORF from human mitochondrial DNA, hidden inside the 16S rRNA gene (a gene inside a gene). Read with the standard code it makes the 24-aa peptide. Switch the Genetic code to "Mitochondria": AGG becomes STOP and you get the 21-aa mitochondrial form.' },
+  { id: 'motsc', group: 'Microproteins (dark proteome)', emoji: '🏃', name: 'MOTS-c (16 aa)', uniprot: 'A0A0C5B5G6',
+    seq: () => 'ATGAGGTGGCAAGAAATGGGCTACATTTTCTACCCCAGAAAACTACGATAG',
+    specials: [{ pos: 14, to: 'Q', fn: 0.7, title: 'The real m.1382A>C variant (Lys14Gln)', text: 'A natural human variant of the mitochondrial 12S rRNA gene changes lysine 14 of MOTS-c to glutamine. It is common in parts of East Asia and has been studied for links to longevity and diabetes.' }],
+    blurb: 'The real 51-letter ORF from human mitochondrial DNA (positions 1343–1391, inside the 12S rRNA gene), found in 2015. It is made in the cytoplasm with the standard code; try the Mitochondria code and see why. Change codon 14 AAA→CAA for a real human variant.' },
   { id: 'sln', group: 'Microproteins (dark proteome)', emoji: '💪', name: 'Sarcolipin (31 aa)', prot: PROT.SLN, uniprot: 'O00631', ensembl: 'SLN',
     blurb: "A muscle microprotein that's basically one oily helix in a membrane. It slows the calcium pump SERCA, which helps muscles make heat. " + SPELLED },
   { id: 'pln', group: 'Microproteins (dark proteome)', emoji: '❤️', name: 'Phospholamban (52 aa)', prot: PROT.PLN, uniprot: 'P26678', ensembl: 'PLN',
@@ -1429,11 +1450,12 @@ const Lab = {
     const lo = c ? c.start + 3 : 0, hi = c ? Math.max(lo + 1, c.end - 3) : s.length;
     const i = lo + ((Math.random() * (hi - lo)) | 0);
     const roll = Math.random();
-    if (roll < 0.8) {
-      const opts = G.BASES.filter(b => b !== s[i]); const nb = opts[(Math.random() * 3) | 0];
+    if (roll < 0.9) {
+      const nb = G.pointMutation(s[i]);
+      const kind = G.TRANSITION[s[i]] === nb ? 'a transition (the commonest kind)' : 'a transversion';
       this.commit(s.slice(0, i) + nb + s.slice(i + 1), { a: i, b: i });
-      Guide.say('🎲 Random mutation: base ' + (i + 1) + ' changed from <b>' + s[i] + '</b> to <b>' + nb + '</b>.');
-    } else if (roll < 0.9) {
+      Guide.say('🎲 Random mutation: base ' + (i + 1) + ' changed from <b>' + s[i] + '</b> to <b>' + nb + '</b>, ' + kind + '.');
+    } else if (roll < 0.95) {
       const nb = G.BASES[(Math.random() * 4) | 0];
       this.commit(s.slice(0, i) + nb + s.slice(i), { a: i, b: i });
       Guide.say('🎲 Random mutation: a <b>' + nb + '</b> was inserted at position ' + (i + 1) + '.');
@@ -1745,12 +1767,15 @@ const Lab = {
     const c = this.cds;
     const isMain = o => o.strand === '+' && c.found && !c.frameMode && o.start === c.start;
     const box = $('#orfList'); box.textContent = '';
+    const pStop = G.stopProb(d.seq, d.code);
+    const luck = n => { const q = G.orfLuck(n, pStop); return q > 0.2 ? 'common by chance' : q > 0.01 ? '1 in ' + Math.round(1 / q) + ' by chance' : q > 1e-6 ? '1 in ' + Math.round(1 / q).toLocaleString() + ' by chance' : 'almost never by chance'; };
+    box.append(h('div', { class: 'tiny muted', text: 'In random DNA with this letter mix, a STOP turns up every ~' + Math.round(1 / pStop) + ' codons, so short ORFs happen by luck all the time. That’s why gene-finders used to skip anything under ~100 codons.' }));
     if (!list.length) box.append(h('div', { class: 'small muted', text: 'No open reading frames this long. Try lowering the slider.' }));
     for (const o of list.slice(0, 40)) {
       const main = isMain(o);
       const tag = main ? h('span', { class: 'pill good', text: 'main gene' }) : o.aa < 100 ? h('span', { class: 'pill accent', text: 'microprotein?' }) : h('span', { class: 'pill', text: 'big ORF' });
       box.append(h('div', { class: 'orf' },
-        h('div', null, h('b', { text: 'Frame ' + o.strand + (o.frame + 1) + ' · ' + o.aa + ' aa ' }), tag, h('div', { class: 'mono', title: o.protein, text: o.protein })),
+        h('div', null, h('b', { text: 'Frame ' + o.strand + (o.frame + 1) + ' · ' + o.aa + ' aa ' }), tag, h('span', { class: 'tiny muted', title: 'Chance that a random ATG reads this many codons before hitting a STOP', text: ' ' + luck(o.aa) }), h('div', { class: 'mono', title: o.protein, text: o.protein })),
         main ? null : h('button', { class: 'btn sm', onclick: () => this.readOrf(o), text: o.strand === '+' ? 'Read it' : 'Flip & read' })));
     }
     this.renderORFMap();
@@ -2131,7 +2156,7 @@ const Pond = {
   /* tuning knobs */
   P: { predEvery: 10, catches: 12, catchRate: 3.5, visExp: 2, camoDiv: 150, denovoMin: 9, junkLen: 72, need0: 16, needSize: 8,
     life0: 32, lifeRand: 14, birthAge: 3, foodE: 7, sizeFood: 0.45, pigWin: 6, sex: true },
-  W: 1000, H: 625, running: true, speed: 3, floor: 'sand', temp: 22, food: 12, pred: 4, mut: 6,
+  W: 1000, H: 625, running: true, speed: 3, floor: 'sand', temp: 22, food: 12, pred: 4, mut: 3,
   creatures: [], foods: [], preds: [], fx: [], t: 0, nextId: 1, nextPred: 8, stats: null, hist: [],
   sel: null, heatWave: 0, baseTemp: 22, bottleT: -1, maxGen: 0, seenDenovo: new Set(), founder: null,
   lastChart: 0, lastSample: -1, rnd: Math.random, pebbles: null, camoT: 0, started: false,
@@ -2158,8 +2183,8 @@ const Pond = {
   init() {
     this.cv = $('#pondCanvas'); this.ctx = this.cv.getContext('2d');
     this.founder = this.founderGenome();
-    const st = Store.get('pondSettings', null);
-    if (st) Object.assign(this, { floor: FLOORS[st.floor] ? st.floor : 'sand', temp: st.temp ?? 22, food: st.food ?? 12, pred: st.pred ?? 4, mut: st.mut ?? 6, speed: st.speed ?? 3 });
+    const st = Store.get('pondSettings2', null);
+    if (st) Object.assign(this, { floor: FLOORS[st.floor] ? st.floor : 'sand', temp: st.temp ?? 22, food: st.food ?? 12, pred: st.pred ?? 4, mut: st.mut ?? 3, speed: st.speed ?? 3 });
     this.baseTemp = this.temp;
     $('#tempIn').value = this.temp; $('#foodIn').value = this.food; $('#predIn').value = this.pred; $('#mutIn').value = this.mut;
     $('#tempIn').addEventListener('input', e => { this.baseTemp = +e.target.value; this.temp = this.baseTemp + (this.heatWave > 0 ? 10 : 0); this.syncCtl(); });
@@ -2211,9 +2236,9 @@ const Pond = {
     const rate = this.mut / 1000;
     $('#mutVal').textContent = fmt(rate * 100, 1) + '% per letter';
     const gl = GENE_KEYS.reduce((a, k) => a + this.founder[k].length, 0);
-    $('#mutHint').textContent = 'About ' + fmt(rate * gl, 1) + ' DNA changes per baby (each genome has ~' + gl + ' letters).';
+    $('#mutHint').textContent = 'About ' + fmt(rate * gl * 1.11, 1) + ' DNA changes per baby (genome ~' + gl + ' letters; 2 of 3 swaps are transitions, 1 in 10 changes is an insertion/deletion). Real humans: ~1.2 per 100 million letters per generation, so the pond runs hundreds of thousands of times faster.';
     $('#playBtn').textContent = this.running ? '⏸ Pause' : '▶ Play';
-    Store.set('pondSettings', { floor: this.floor, temp: this.baseTemp, food: this.food, pred: this.pred, mut: this.mut, speed: this.speed });
+    Store.set('pondSettings2', { floor: this.floor, temp: this.baseTemp, food: this.food, pred: this.pred, mut: this.mut, speed: this.speed });
   },
   resize() {
     const cv = this.cv; if (!cv.clientWidth) return;
@@ -2294,15 +2319,18 @@ const Pond = {
     }
   },
   mutate(g) {
+    /* Each letter mutates with probability `rate` (exactly the rate shown in the UI).
+       About 1 in 10 mutations is a 1-letter insertion or deletion, as in human families. */
     const rate = this.mut / 1000, out = {};
     for (const k of GENE_KEYS) {
-      let s = g[k];
-      if (Math.random() < rate * s.length * 1.2) {
-        const arr = s.split('');
-        for (let i = 0; i < arr.length; i++) if (Math.random() < rate) { const o = G.BASES.filter(b => b !== arr[i]); arr[i] = o[(Math.random() * 3) | 0]; }
-        s = arr.join('');
+      let s = g[k], arr = null;
+      for (let i = 0; i < s.length; i++) {
+        if (Math.random() >= rate) continue;
+        if (!arr) arr = s.split('');
+        arr[i] = G.pointMutation(arr[i]);
       }
-      if (Math.random() < rate * s.length * 0.06) {
+      if (arr) s = arr.join('');
+      if (Math.random() < rate * 0.11 * s.length) {
         const i = (Math.random() * s.length) | 0;
         if (Math.random() < 0.5 && s.length > 15) s = s.slice(0, i) + s.slice(i + 1);
         else if (s.length < 90) s = s.slice(0, i) + G.BASES[(Math.random() * 4) | 0] + s.slice(i);
@@ -2604,6 +2632,8 @@ class LineChart {
 const Secret = {
   orig: '', enc: '', dmg: '', hits: [],
   B2: ['A', 'C', 'G', 'T'],
+  /* Goldman et al. 2013 table: after A use C,G,T; after C use G,T,A; after G use T,A,C; after T use A,C,G. */
+  rot(prev) { const i = 'ACGT'.indexOf(prev); return [1, 2, 3].map(k => 'ACGT'[(i + k) % 4]); },
   init() {
     ['input', 'change'].forEach(ev => {
       $('#msgIn').addEventListener(ev, debounce(() => this.encode(true), 200));
@@ -2617,7 +2647,7 @@ const Secret = {
     $('#copyDna').addEventListener('click', async () => { try { await navigator.clipboard.writeText(this.enc); UI.toast('📋', 'Copied', this.enc.length + ' DNA letters copied.'); } catch (e) { UI.toast('📋', 'Copy failed', 'Your browser blocked the clipboard.'); } });
     $('#storageFacts').innerHTML = [
       '<p><b>2 bits per letter.</b> With 4 letters, each base can store 2 binary digits: A=00, C=01, G=10, T=11. One text character (8 bits) needs 4 bases.</p>',
-      '<p><b>Avoid repeats.</b> Sequencing machines misread long runs like AAAAAA. In 2013 Nick Goldman’s team at EMBL-EBI stored Shakespeare’s sonnets with a code where the next letter always differs from the last one. Our <i>No-repeat code</i> uses the same trick.</p>',
+      '<p><b>Avoid repeats.</b> Sequencing machines misread long runs like AAAAAA. In 2013 Nick Goldman’s team at EMBL-EBI stored Shakespeare’s sonnets with a code where the next letter always differs from the last one. Our <i>No-repeat code</i> uses their exact rotation table (after A use C/G/T, after C use G/T/A, and so on).</p>',
       '<p><b>Expect errors.</b> DNA gets damaged, and writing and reading it makes mistakes. Real systems add error-correcting codes. In 2017 the “DNA Fountain” method stored a whole operating system and a film at about 1.6 bits per base and recovered them perfectly.</p>',
       '<p><b>Deletions are the worst.</b> A missing letter shifts everything after it, just like a frameshift in a gene. Tick “lose a letter” to see the damage.</p>',
       '<p><b>Watermarks.</b> In 2010 the J. Craig Venter Institute hid names and a James Joyce quote inside the DNA of its synthetic bacterium, spelled with an amino-acid letter code, like our <i>Protein words</i>.</p>',
@@ -2634,7 +2664,7 @@ const Secret = {
       for (const b of this.bytes(msg)) {
         let v = b; const tr = [];
         for (let i = 0; i < 6; i++) { tr.unshift(v % 3); v = Math.floor(v / 3); }
-        for (const t of tr) { const opts = G.BASES.filter(x => x !== prev); prev = opts[t]; o += prev; }
+        for (const t of tr) { prev = this.rot(prev)[t]; o += prev; }
       }
       return o;
     }
@@ -2652,7 +2682,7 @@ const Secret = {
       const out = []; let prev = 'A';
       for (let i = 0; i + 6 <= dna.length; i += 6) {
         let v = 0;
-        for (let j = 0; j < 6; j++) { const c = dna[i + j]; const opts = G.BASES.filter(x => x !== prev); let t = opts.indexOf(c); if (t < 0) t = 0; v = v * 3 + t; prev = c; }
+        for (let j = 0; j < 6; j++) { const c = dna[i + j]; let t = this.rot(prev).indexOf(c); if (t < 0) t = 0; v = v * 3 + t; prev = c; }
         out.push(v > 255 ? 63 : v);
       }
       return this.text(new Uint8Array(out));
@@ -2821,7 +2851,7 @@ const LIB = [
     try: ['See it in the Lab', 'preset:hbb'], src: [['Crick 1970, Nature: Central dogma of molecular biology', EPMC('Central dogma of molecular biology')]] },
   { id: 'code', cat: 'basics', em: '🔤', title: 'The genetic code', short: '64 codons, 20 amino acids, 3 STOP signs.',
     body: ['With 4 letters in groups of 3 there are 4 × 4 × 4 = <b>64 codons</b>. 61 of them code for the 20 amino acids, and 3 (TAA, TAG, TGA) mean <b>STOP</b>. ATG means “start here”, and it also codes for methionine.',
-      'Most amino acids have several codons, so many single-letter changes are <b>silent</b>. GGT, GGC, GGA and GGG all mean glycine.',
+      'Most amino acids have several codons, so many single-letter changes are <b>silent</b>. GGT, GGC, GGA and GGG all mean glycine. Of the 549 possible single-letter changes to the 61 non-STOP codons, <b>134 are silent, 392 missense and 23 nonsense</b>.',
       'The first codon was cracked in 1961, when Marshall Nirenberg and Heinrich Matthaei made a protein from RNA containing only U’s and got a chain of only phenylalanine: <b>UUU = Phe</b>.'],
     cool: 'The code is nearly universal: the same codons mean the same thing in bacteria, mushrooms and you. That’s a big clue that all life shares one ancestor.',
     try: ['Try a silent mutation', 'preset:starter'], src: [['Nirenberg & Matthaei 1961, PNAS', EPMC('The dependence of cell-free protein synthesis in E. coli upon naturally occurring or synthetic polyribonucleotides')]] },
@@ -2834,9 +2864,9 @@ const LIB = [
   { id: 'mutation', cat: 'basics', em: '🎲', title: 'Mutations', short: 'Typos in DNA: usually harmless, sometimes harmful, occasionally brilliant.',
     body: ['A <b>substitution</b> swaps one letter. It can be <b>silent</b> (same amino acid), <b>missense</b> (a different amino acid) or <b>nonsense</b> (a new STOP).',
       '<b>Insertions</b> and <b>deletions</b> add or remove letters. If the number isn’t a multiple of 3 the reading frame shifts and everything after is scrambled: a <b>frameshift</b>.',
-      'Every person is born with roughly <b>50–100 brand-new mutations</b> that neither parent had. Most land where they don’t matter. The rare helpful ones are the raw material of evolution.'],
+      'Every person is born with roughly <b>50–100 brand-new mutations</b> that neither parent had, about 1.2 changes per 100 million letters per generation. <b>Transitions</b> (A↔G, C↔T) happen about twice as often as other swaps, and roughly 1 in 10 new mutations is a small insertion or deletion. Most land where they don’t matter. The rare helpful ones are the raw material of evolution.'],
     cool: 'Without mutations there would be no variety, and evolution would have nothing to work with.',
-    try: ['Cause a frameshift', 'preset:starter'], src: [['Jónsson et al. 2017, Nature: de novo mutations in 1,548 Icelandic trios', EPMC('Parental influence on human germline de novo mutations in 1,548 trios from Iceland')]] },
+    try: ['Cause a frameshift', 'preset:starter'], src: [['Jónsson et al. 2017, Nature: de novo mutations in 1,548 Icelandic trios', EPMC('Parental influence on human germline de novo mutations in 1,548 trios from Iceland')], ['Kong et al. 2012, Nature: rate of de novo mutations', EPMC('Rate of de novo mutations and the importance of father\'s age to disease risk')]] },
   { id: 'sickle', cat: 'basics', em: '🩸', title: 'Sickle cell: one letter', short: 'The most famous single-letter mutation.',
     body: ['In the β-globin gene (<b>HBB</b>), amino acid 6 is glutamic acid, coded by <b>GAG</b>. Change the middle A to T and you get <b>GTG</b>: valine.',
       'That one oily valine makes haemoglobin molecules stick together into long fibres when oxygen is low. The fibres bend red blood cells into stiff sickles that can block blood vessels.',
@@ -2869,7 +2899,7 @@ const LIB = [
     cool: 'Many dark regions are “intrinsically disordered”. They never settle into one shape, more like wriggling spaghetti than folded origami.',
     try: ['Meet a microprotein', 'preset:humanin'], src: [['Perdigão et al. 2015, PNAS: Unexpected features of the dark proteome', EPMC('Unexpected features of the dark proteome')]] },
   { id: 'micro', cat: 'dark', em: '🔬', title: 'Microproteins', short: 'Proteins under 100 amino acids, hiding in plain sight.',
-    body: ['For decades, gene-finding programs ignored ORFs shorter than about <b>100 codons</b>. Random DNA is full of short ORFs, and counting them all would have swamped the real genes with fakes.',
+    body: ['For decades, gene-finding programs ignored ORFs shorter than about <b>100 codons</b>. In random DNA a STOP turns up about every 21 codons (3 of the 64 codons are STOPs), so short ORFs appear by luck all the time. Only about 1 random ATG in 120 reads 100 codons, but a genome has millions of ATGs. Counting every short ORF would have swamped the real genes with fakes.',
       'That rule hid a whole world. <b>Microproteins</b> (also called micropeptides or sORF peptides) turn out to help control muscle, metabolism, DNA repair, immunity and more.',
       'They hide in RNAs labelled “non-coding”, in the leader before a main gene (uORFs), in other reading frames of known genes, and even inside mitochondrial RNA genes.'],
     cool: 'Some “long non-coding RNAs” were mislabelled. They actually make tiny proteins.',
@@ -2897,14 +2927,14 @@ const LIB = [
     body: ['Discovered in 2001 by Yuichi Hashimoto, Ikuo Nishimoto and colleagues while searching for genes that protect neurons from damage linked to Alzheimer’s disease.',
       'Its ORF sits inside the mitochondrial <b>16S ribosomal RNA gene</b> (MT-RNR2), a gene that was supposed to make only RNA. A gene inside a gene!',
       'Humanin became the founding member of the <b>mitochondrial-derived peptides</b>, which now include MOTS-c and the SHLP family.'],
-    cool: 'Mitochondria use a slightly different genetic code. Humanin made inside mitochondria would be 21 amino acids long; the version made in the cytoplasm is 24.',
+    cool: 'Mitochondria use a slightly different genetic code. In the real ORF, codon 22 is AGG, which means STOP inside mitochondria. So humanin made there is 21 amino acids long, while the version made in the cytoplasm is 24. Try both codes in the Lab!',
     try: ['Load humanin', 'preset:humanin'], src: [['Hashimoto et al. 2001, PNAS', EPMC('A rescue factor abolishing neuronal cell death by a wide spectrum of familial Alzheimer\'s disease genes and Abeta')]] },
   { id: 'motsc', cat: 'dark', em: '🏃', title: 'MOTS-c', short: 'A 16-amino-acid metabolism regulator from mitochondrial DNA.',
     body: ['In 2015 Changhan Lee, Pinchas Cohen and colleagues scanned the mitochondrial <b>12S rRNA gene</b> for hidden ORFs and found one making a 16-amino-acid peptide: <b>MOTS-c</b>.',
       'MOTS-c acts on metabolism through an energy-sensing enzyme called AMPK. In mice it helped prevent the obesity and insulin resistance caused by a high-fat diet.',
       'It is now studied in ageing and exercise. The mouse results are exciting, but human evidence is still limited.'],
-    cool: 'Under stress MOTS-c can move into the nucleus and help switch genes on, so a mitochondrial gene ends up talking to nuclear genes.',
-    try: ['Load MOTS-c', 'preset:motsc'], src: [['Lee et al. 2015, Cell Metabolism', EPMC('The mitochondrial-derived peptide MOTS-c promotes metabolic homeostasis and reduces obesity and insulin resistance')]] },
+    cool: 'Codon 2 of the MOTS-c ORF is AGG, a STOP in the mitochondrial code, so MOTS-c has to be made outside mitochondria with the standard code. A natural variant, m.1382A>C (Lys14Gln), has been linked to exceptional longevity in Japanese people.',
+    try: ['Load MOTS-c', 'preset:motsc'], src: [['Lee et al. 2015, Cell Metabolism', EPMC('The mitochondrial-derived peptide MOTS-c promotes metabolic homeostasis and reduces obesity and insulin resistance')], ['Fuku et al. 2015, Aging Cell: MOTS-c and exceptional longevity', EPMC('The mitochondrial-derived peptide MOTS-c: a player in exceptional longevity?')]] },
   { id: 'muscle', cat: 'dark', em: '💪', title: 'Muscle microproteins', short: 'Tiny proteins that work the brakes and accelerator of muscle.',
     body: ['Muscles contract when calcium floods in, and relax when the pump <b>SERCA</b> pulls it back out. Several microproteins tune this pump. <b>Phospholamban</b> (52 aa, heart), <b>sarcolipin</b> (31 aa) and <b>myoregulin</b> (46 aa, found in 2015 in an RNA thought to be non-coding) all act as brakes.',
       'In 2016 Eric Olson’s lab found <b>DWORF</b>, a 34-amino-acid microprotein from another “non-coding” RNA. It works the other way: it boosts SERCA, partly by pushing the brake proteins aside.',

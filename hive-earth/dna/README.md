@@ -21,3 +21,29 @@ uses simplified *game rules* for how proteins become traits, and the "Will it st
 work?" meter is a playful estimate, not a prediction.
 
 Progress is saved in your browser (localStorage) and stays on your device.
+
+## Verification
+
+`verify/` checks the simulator against independent reference data (25 checks, all passing):
+
+- **Genetic code:** standard, vertebrate-mitochondrial and ciliate tables match NCBI (via Biopython)
+  exactly; 2,250 translations, reverse complements and six-frame ORF scans of random DNA agree.
+  The PL0344 dialect differs from standard only at TAA→Lys and TAG→Glu (McGowan et al. 2023).
+- **Protein maths:** molecular weight is within 0.002% of Biopython (HBB 15,998 Da, insulin 11,981 Da,
+  GFP 26,886 Da). GRAVY is exact. Charge and pI use the ExPASy/Bjellqvist pKa method and match
+  Biopython (HBB pI 6.74, insulin 5.22, GFP 5.67).
+- **Known biology:** the 549 single-base changes split 134 silent / 392 missense / 23 nonsense.
+  Membrane helices are predicted at sarcolipin 8–26 and phospholamban 31–49 (known 8–26 and 31–52).
+  The real humanin ORF gives 24 aa with the standard code and 21 aa with the mitochondrial code.
+  MOTS-c gives MRWQEMGYIFYPRKLR.
+- **Statistics:** random-DNA ORF lengths follow the geometric model (STOP every ~21 codons). The pond
+  mutates at exactly the rate shown, with transitions twice as common as transversions
+  (Ti/Tv ≈ 2, as in humans) and ~1 in 10 changes an insertion/deletion.
+
+Run it from this folder:
+
+```
+python -m http.server 8799 &
+pip install biopython && python verify/reference.py verify/reference.json
+npm i playwright && node verify/verify.js verify/reference.json
+```
